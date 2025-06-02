@@ -25,3 +25,81 @@ This involves setting up your infrastructure in both regions.
 1. Enable Necessary APIs
 
 Open Cloud Shell or your local terminal and run:
+
+gcloud services enable compute.googleapis.com \
+                       sqladmin.googleapis.com \
+                       storage.googleapis.com \
+                       logging.googleapis.com \
+                       monitoring.googleapis.com \
+                       cloudbuild.googleapis.com
+
+2. Create Network and Firewall Rules
+
+We'll use a single VPC network spanning both regions.
+
+# Create a VPC network
+gcloud compute networks create dr-network --subnet-mode=auto
+
+# Allow SSH, HTTP, and health checks
+gcloud compute firewall-rules create dr-network-allow-all \
+    --network=dr-network \
+    --allow=tcp:22,tcp:80,tcp:443,icmp \
+    --source-ranges=0.0.0.0/0
+
+3. Set up Cloud SQL (PostgreSQL Example)
+
+We'll create a primary instance in us-central1 and a cross-region replica in us-east1.
+
+# Define instance names
+export PRIMARY_SQL_INSTANCE="dr-app-sql-primary-us-central1"
+export REPLICA_SQL_INSTANCE="dr-app-sql-replica-us-east1"
+export DB_USER="app_user"
+export DB_PASSWORD="your_strong_password" # CHANGE THIS!
+export DB_NAME="app_db"
+
+# 3a. Create Primary Cloud SQL Instance in us-central1
+gcloud sql instances create $PRIMARY_SQL_INSTANCE \
+    --database-version=POSTGRES_14 \
+    --region=us-central1 \
+    --tier=db-f1-micro \
+    --root-password=$DB_PASSWORD \
+    --storage-auto-increase \
+    --authorized-networks=0.0.0.0/0 # For simplicity, secure in production!
+
+# Wait for the primary instance to be READY (might take a few minutes)
+echo "Waiting for primary SQL instance to be ready..."
+gcloud sql instances describe $PRIMARY_SQL_INSTANCE --format="value(state)"
+
+# Create a database and user
+gcloud sql databases create $DB_NAME --instance=$PRIMARY_SQL_INSTANCE
+gcloud sql users create $DB_USER --host=% --instance=$PRIMARY_SQL_INSTANCE --password=$DB_PASSWORD
+
+# 3b. Create Cross-Region Read Replica in us-east1
+gcloud sql instances create $REPLICA_SQL_INSTANCE \
+    --database-version=POSTGRES_14 \
+    --replica-type=READ_REPLICA \
+    --master-instance-name=$PRIMARY_SQL_INSTANCE \
+    --region=us-east1 \
+    --tier=db-f1-micro \
+    --storage-auto-increase
+
+# Wait for the replica instance to be READY
+echo "Waiting for replica SQL instance to be ready..."
+gcloud sql instances describe $REPLICA_SQL_INSTANCE --format="value(state)"
+
+4. Create Multi-Region Cloud Storage Bucket
+
+This bucket will store a simple static file that our application will read.
+
+export BUCKET_NAME="dr-lab-multi-region-$(gcloud projects describe $GOOGLE_CLOUD_PROJECT --format='value(projectNumber)')"
+
+gcloud storage buckets create gs://$BUCKET_NAME \
+    --location=US \
+    --uniform-bucket-level-access
+
+# Create a sample file
+echo "Hello from Cloud Storage in us-central1 (primary)!" > gs_primary_content.txt
+gcloud storage cp gs_primary_content.txt gs://$BUCKET_NAME/app_data.txt
+
+echo "Verify file content in the bucket:"
+gcloud storage cat gs://$BUCKET_NAME/app_data.txt
