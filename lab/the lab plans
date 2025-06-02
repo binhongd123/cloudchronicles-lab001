@@ -1,41 +1,9 @@
-Lab Objective
-
-Demonstrate: How to failover a simple web application and its database from us-central1 to us-east1.
-Showcase: Cloud SQL cross-region replica promotion.
-Illustrate: Global External HTTP(S) Load Balancer automatic traffic redirection.
-Utilize: Multi-Region Cloud Storage for seamless data access.
-Estimated Cost
-
-Moderate to High: Running two active regions with database replicas and load balancers will incur costs. Expect to pay at least $50-$150+ per month for the core components, even if you clean up immediately after the lab. Costs will vary based on instance sizes, traffic, and how long resources are kept running.
-Important: ALWAYS set budget alerts and delete resources immediately after the lab to minimize costs.
-Prerequisites
-
-Google Cloud Project: An active Google Cloud project.
-Billing Enabled: Billing must be enabled for your project.
-gcloud CLI: The gcloud command-line tool installed and authenticated.
-Permissions: You need Project Owner or IAM roles with permissions to create Compute Engine instances, Cloud SQL instances, Cloud Storage buckets, and Load Balancers.
-Lab Steps
-
-We'll break this down into setup, simulation, and cleanup.
-
-Part 1: Lab Setup (Primary Region: us-central1, Secondary: us-east1)
-
-This involves setting up your infrastructure in both regions.
-
-1. Enable Necessary APIs
-
-Open Cloud Shell or your local terminal and run:
-
 gcloud services enable compute.googleapis.com \
                        sqladmin.googleapis.com \
                        storage.googleapis.com \
                        logging.googleapis.com \
                        monitoring.googleapis.com \
                        cloudbuild.googleapis.com
-
-2. Create Network and Firewall Rules
-
-We'll use a single VPC network spanning both regions.
 
 # Create a VPC network
 gcloud compute networks create dr-network --subnet-mode=auto
@@ -45,10 +13,6 @@ gcloud compute firewall-rules create dr-network-allow-all \
     --network=dr-network \
     --allow=tcp:22,tcp:80,tcp:443,icmp \
     --source-ranges=0.0.0.0/0
-
-3. Set up Cloud SQL (PostgreSQL Example)
-
-We'll create a primary instance in us-central1 and a cross-region replica in us-east1.
 
 # Define instance names
 export PRIMARY_SQL_INSTANCE="dr-app-sql-primary-us-central1"
@@ -87,10 +51,6 @@ gcloud sql instances create $REPLICA_SQL_INSTANCE \
 echo "Waiting for replica SQL instance to be ready..."
 gcloud sql instances describe $REPLICA_SQL_INSTANCE --format="value(state)"
 
-4. Create Multi-Region Cloud Storage Bucket
-
-This bucket will store a simple static file that our application will read.
-
 export BUCKET_NAME="dr-lab-multi-region-$(gcloud projects describe $GOOGLE_CLOUD_PROJECT --format='value(projectNumber)')"
 
 gcloud storage buckets create gs://$BUCKET_NAME \
@@ -103,3 +63,180 @@ gcloud storage cp gs_primary_content.txt gs://$BUCKET_NAME/app_data.txt
 
 echo "Verify file content in the bucket:"
 gcloud storage cat gs://$BUCKET_NAME/app_data.txt
+
+#!/bin/bash
+# Install dependencies
+sudo apt-get update
+sudo apt-get install -y python3-pip git python3-psycopg2
+
+# Install Flask and Google Cloud Storage client
+pip3 install Flask google-cloud-storage
+
+# Clone the app (simple Flask app)
+git clone https://github.com/GoogleCloudPlatform/python-docs-samples.git /tmp/python-docs-samples
+
+# Copy the app to the correct location
+cp /tmp/python-docs-samples/cloud-sql/postgresql/flask /app -r
+cd /app
+
+# Modify app.py to read from Cloud Storage and accept DB host from env
+# This is a simplified approach for the lab. In production, use proper config management.
+sed -i "s/db_user = os.environ.get('DB_USER')/db_user = os.environ.get('DB_USER', 'app_user')/g" app.py
+sed -i "s/db_password = os.environ.get('DB_PASS')/db_password = os.environ.get('DB_PASS', '${DB_PASSWORD}')/g" app.py
+sed -i "s/db_name = os.environ.get('DB_NAME')/db_name = os.environ.get('DB_NAME', 'app_db')/g" app.py
+sed -i "s/db_host = os.environ.get('DB_HOST')/db_host = os.environ.get('DB_HOST', '127.0.0.1')/g" app.py
+sed -i "/app.route('\/')/a \    storage_client = storage.Client()" app.py
+sed -i "/app.route('\/')/a \    bucket_name = os.environ.get('BUCKET_NAME', '')" app.py
+sed -i "/app.route('\/')/a \    bucket = storage_client.get_bucket(bucket_name)" app.py
+sed -i "/app.route('\/')/a \    blob = bucket.blob('app_data.txt')" app.py
+sed -i "/app.route('\/')/a \    gs_content = blob.download_as_text() if blob.exists() else 'N/A'" app.py
+sed -i "s/return 'Hello World!'/return f'Hello from {os.environ.get(\"REGION\")}. DB Host: {db_host}. GS Content: {gs_content}'/g" app.py
+
+
+# Set environment variables (for simplicity, passed via metadata for lab)
+# These will be passed via gcloud instance template metadata
+# export DB_HOST=$(gcloud sql instances describe dr-app-sql-primary-us-central1 --format="value(ipAddress)")
+# export BUCKET_NAME="dr-lab-multi-region-YOUR_PROJECT_NUMBER"
+# export REGION="us-central1"
+
+# Start the Flask app
+python3 app.py &
+
+# Get the IP address of the primary SQL instance
+PRIMARY_SQL_IP=$(gcloud sql instances describe $PRIMARY_SQL_INSTANCE --format="value(ipAddresses[0].ipAddress)")
+
+# Create instance template for us-central1
+gcloud compute instance-templates create dr-app-template-us-central1 \
+    --machine-type=e2-micro \
+    --network=dr-network \
+    --metadata-from-file=startup-script=startup.sh \
+    --metadata=DB_HOST="$PRIMARY_SQL_IP",BUCKET_NAME="$BUCKET_NAME",REGION="us-central1",DB_USER="$DB_USER",DB_PASS="$DB_PASSWORD",DB_NAME="$DB_NAME" \
+    --tags=http-server \
+    --image-family=debian-11 \
+    --image-project=debian-cloud
+
+# Create instance template for us-east1 (initially pointing to primary DB IP)
+gcloud compute instance-templates create dr-app-template-us-east1 \
+    --machine-type=e2-micro \
+    --network=dr-network \
+    --metadata-from-file=startup-script=startup.sh \
+    --metadata=DB_HOST="$PRIMARY_SQL_IP",BUCKET_NAME="$BUCKET_NAME",REGION="us-east1",DB_USER="$DB_USER",DB_PASS="$DB_PASSWORD",DB_NAME="$DB_NAME" \
+    --tags=http-server \
+    --image-family=debian-11 \
+    --image-project=debian-cloud
+
+# Create MIG in us-central1 (active)
+gcloud compute instance-groups managed create dr-app-mig-us-central1 \
+    --template=dr-app-template-us-central1 \
+    --size=1 \
+    --zone=us-central1-a # Choose an available zone in us-central1
+
+# Create MIG in us-east1 (scaled down, ready for failover)
+gcloud compute instance-groups managed create dr-app-mig-us-east1 \
+    --template=dr-app-template-us-east1 \
+    --size=0 \
+    --zone=us-east1-b # Choose an available zone in us-east1
+
+# 6a. Create health check
+gcloud compute health-checks create http http-dr-health-check \
+    --request-path=/ \
+    --port=80
+
+# 6b. Create backend service for us-central1 MIG (primary)
+gcloud compute backend-services create dr-backend-us-central1 \
+    --protocol=HTTP \
+    --health-checks=http-dr-health-check \
+    --global
+
+gcloud compute backend-services add-backend dr-backend-us-central1 \
+    --instance-group=dr-app-mig-us-central1 \
+    --instance-group-zone=us-central1-a \
+    --global
+
+# 6c. Create backend service for us-east1 MIG (secondary/failover)
+gcloud compute backend-services create dr-backend-us-east1 \
+    --protocol=HTTP \
+    --health-checks=http-dr-health-check \
+    --global
+
+gcloud compute backend-services add-backend dr-backend-us-east1 \
+    --instance-group=dr-app-mig-us-east1 \
+    --instance-group-zone=us-east1-b \
+    --global
+
+# Set primary/backup relationship using priority (lower number = higher priority)
+# us-central1 has higher priority (10), us-east1 has lower priority (20)
+gcloud compute backend-services update dr-backend-us-central1 --priority=10 --global
+gcloud compute backend-services update dr-backend-us-east1 --priority=20 --global
+
+# 6d. Create URL map, target HTTP proxy, and forwarding rule
+gcloud compute url-maps create dr-url-map --default-service=dr-backend-us-central1
+gcloud compute target-http-proxies create dr-http-proxy --url-map=dr-url-map
+gcloud compute forwarding-rules create dr-forwarding-rule \
+    --global \
+    --ports=80 \
+    --target-http-proxy=dr-http-proxy
+
+echo "Load Balancer setup complete. It may take several minutes for the IP to become active."
+
+gcloud compute forwarding-rules describe dr-forwarding-rule --global --format="value(IPAddress)"
+
+echo "Simulating us-central1 outage by scaling down its MIG..."
+gcloud compute instance-groups managed set-size dr-app-mig-us-central1 --size=0 --zone=us-central1-a
+
+echo "Promoting us-east1 replica to primary. This will break replication."
+gcloud sql instances promote-replica $REPLICA_SQL_INSTANCE
+
+# Get the IP address of the NEW primary SQL instance (the one just promoted)
+NEW_PRIMARY_SQL_IP=$(gcloud sql instances describe $REPLICA_SQL_INSTANCE --format="value(ipAddresses[0].ipAddress)")
+
+echo "New primary DB IP: $NEW_PRIMARY_SQL_IP"
+
+# Create a NEW instance template for us-east1 pointing to the new primary DB IP
+gcloud compute instance-templates create dr-app-template-us-east1-newdb \
+    --machine-type=e2-micro \
+    --network=dr-network \
+    --metadata-from-file=startup-script=startup.sh \
+    --metadata=DB_HOST="$NEW_PRIMARY_SQL_IP",BUCKET_NAME="$BUCKET_NAME",REGION="us-east1",DB_USER="$DB_USER",DB_PASS="$DB_PASSWORD",DB_NAME="$DB_NAME" \
+    --tags=http-server \
+    --image-family=debian-11 \
+    --image-project=debian-cloud
+
+# Update the us-east1 MIG to use the new template (rolling update)
+echo "Updating us-east1 MIG to use the new instance template..."
+gcloud compute instance-groups managed rolling-action start dr-app-mig-us-east1 \
+    --new-instance-template=dr-app-template-us-east1-newdb \
+    --zone=us-east1-b
+
+echo "Scaling up us-east1 MIG to handle traffic..."
+gcloud compute instance-groups managed set-size dr-app-mig-us-east1 --size=1 --zone=us-east1-b
+
+# Delete Load Balancer components
+gcloud compute forwarding-rules delete dr-forwarding-rule --global -q
+gcloud compute target-http-proxies delete dr-http-proxy --global -q
+gcloud compute url-maps delete dr-url-map -q
+gcloud compute backend-services delete dr-backend-us-central1 --global -q
+gcloud compute backend-services delete dr-backend-us-east1 --global -q
+gcloud compute health-checks delete http-dr-health-check -q
+
+# Delete Managed Instance Groups
+gcloud compute instance-groups managed delete dr-app-mig-us-central1 --zone=us-central1-a -q
+gcloud compute instance-groups managed delete dr-app-mig-us-east1 --zone=us-east1-b -q
+
+# Delete Instance Templates
+gcloud compute instance-templates delete dr-app-template-us-central1 -q
+gcloud compute instance-templates delete dr-app-template-us-east1 -q
+gcloud compute instance-templates delete dr-app-template-us-east1-newdb -q
+
+# Delete Cloud SQL Instances
+gcloud sql instances delete $PRIMARY_SQL_INSTANCE -q
+gcloud sql instances delete $REPLICA_SQL_INSTANCE -q
+
+# Delete Cloud Storage Bucket
+gcloud storage rm -r gs://$BUCKET_NAME -q
+
+# Delete Network and Firewall Rules
+gcloud compute firewall-rules delete dr-network-allow-all -q
+gcloud compute networks delete dr-network -q
+
+echo "All lab resources have been deleted. Verify in Google Cloud Console."
