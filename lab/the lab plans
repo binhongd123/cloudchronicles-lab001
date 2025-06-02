@@ -1,1 +1,27 @@
+Lab Objective
 
+Demonstrate: How to failover a simple web application and its database from us-central1 to us-east1.
+Showcase: Cloud SQL cross-region replica promotion.
+Illustrate: Global External HTTP(S) Load Balancer automatic traffic redirection.
+Utilize: Multi-Region Cloud Storage for seamless data access.
+Estimated Cost
+
+Moderate to High: Running two active regions with database replicas and load balancers will incur costs. Expect to pay at least $50-$150+ per month for the core components, even if you clean up immediately after the lab. Costs will vary based on instance sizes, traffic, and how long resources are kept running.
+Important: ALWAYS set budget alerts and delete resources immediately after the lab to minimize costs.
+Prerequisites
+
+Google Cloud Project: An active Google Cloud project.
+Billing Enabled: Billing must be enabled for your project.
+gcloud CLI: The gcloud command-line tool installed and authenticated.
+Permissions: You need Project Owner or IAM roles with permissions to create Compute Engine instances, Cloud SQL instances, Cloud Storage buckets, and Load Balancers.
+Lab Steps
+
+We'll break this down into setup, simulation, and cleanup.
+
+Part 1: Lab Setup (Primary Region: us-central1, Secondary: us-east1)
+
+This involves setting up your infrastructure in both regions.
+
+1. Enable Necessary APIs
+
+Open Cloud Shell or your local terminal and run:
