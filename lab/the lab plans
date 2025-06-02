@@ -1,242 +1,79 @@
-gcloud services enable compute.googleapis.com \
-                       sqladmin.googleapis.com \
-                       storage.googleapis.com \
-                       logging.googleapis.com \
-                       monitoring.googleapis.com \
-                       cloudbuild.googleapis.com
+- **Primary Region**: europe-west1
+- **Backup Location**: europe-west4
+- **RTO (Recovery Time Objective)**: Aim for < 60 minutes for Dataflow pipeline re-activation.
+- **RPO (Recovery Point Objective)**: Aim for < 5 minutes for data ingestion (critical to not lose any messages).
 
-# Create a VPC network
-gcloud compute networks create dr-network --subnet-mode=auto
+---
 
-# Allow SSH, HTTP, and health checks
-gcloud compute firewall-rules create dr-network-allow-all \
-    --network=dr-network \
-    --allow=tcp:22,tcp:80,tcp:443,icmp \
-    --source-ranges=0.0.0.0/0
+### **STAR-Based Disaster Recovery Plan: Data Pipeline Resilience**
 
-# Define instance names
-export PRIMARY_SQL_INSTANCE="dr-app-sql-primary-us-central1"
-export REPLICA_SQL_INSTANCE="dr-app-sql-replica-us-east1"
-export DB_USER="app_user"
-export DB_PASSWORD="your_strong_password" # CHANGE THIS!
-export DB_NAME="app_db"
+#### **S - Situation:**
+Our critical data processing pipeline, including Pub/Sub ingestion, Dataflow processing, BigQuery storage, and Cloud Storage archiving, is primarily deployed in the `europe-west1` region. A regional outage in `europe-west1` would halt data ingestion and real-time analytics, severely impacting business operations and leading to potential data loss.
 
-# 3a. Create Primary Cloud SQL Instance in us-central1
-gcloud sql instances create $PRIMARY_SQL_INSTANCE \
-    --database-version=POSTGRES_14 \
-    --region=us-central1 \
-    --tier=db-f1-micro \
-    --root-password=$DB_PASSWORD \
-    --storage-auto-increase \
-    --authorized-networks=0.0.0.0/0 # For simplicity, secure in production!
+#### **T - Task:**
+To implement a robust disaster recovery plan that ensures continuous data ingestion and raw data archiving, along with the ability to resume core data processing, by failing over to `europe-west4` in the event of an `europe-west1` regional outage. We must achieve defined RTO and RPO targets for data availability.
 
-# Wait for the primary instance to be READY (might take a few minutes)
-echo "Waiting for primary SQL instance to be ready..."
-gcloud sql instances describe $PRIMARY_SQL_INSTANCE --format="value(state)"
+#### **A - Action:**
 
-# Create a database and user
-gcloud sql databases create $DB_NAME --instance=$PRIMARY_SQL_INSTANCE
-gcloud sql users create $DB_USER --host=% --instance=$PRIMARY_SQL_INSTANCE --password=$DB_PASSWORD
+**1. Pre-Outage Preparation (Continuous Readiness):**
 
-# 3b. Create Cross-Region Read Replica in us-east1
-gcloud sql instances create $REPLICA_SQL_INSTANCE \
-    --database-version=POSTGRES_14 \
-    --replica-type=READ_REPLICA \
-    --master-instance-name=$PRIMARY_SQL_INSTANCE \
-    --region=us-east1 \
-    --tier=db-f1-micro \
-    --storage-auto-increase
+* **Pub/Sub Messaging:**
+    * Utilize **global Pub/Sub topics** (not regional) for all data ingestion. This ensures the topic itself is resilient to a single region failure.
+    * For critical subscriptions that must continue processing, configure **cross-region push subscriptions** to Cloud Functions or Cloud Run services deployed in both `europe-west1` and `europe-west4`. Alternatively, set up pull subscriptions from consumers in both regions.
+    * Enable **message retention** on topics for sufficient duration (e.g., 7 days) to allow for re-processing during recovery.
+    * **GCP Tool:** Pub/Sub (Global Topics, Push/Pull Subscriptions), Cloud Functions/Cloud Run
+* **Cloud Storage for Raw Data Archiving:**
+    * Store all raw ingested data in a **Multi-Region Cloud Storage bucket** (e.g., `EU` multi-region). This provides automatic replication and access from either `europe-west1` or `europe-west4`.
+    * **GCP Tool:** Cloud Storage (Multi-Region Buckets)
+* **BigQuery Data Storage:**
+    * For intermediate or final BigQuery datasets, consider **BigQuery multi-region datasets** (e.g., `EU` multi-region) for high availability and redundancy within the EU. Alternatively, implement cross-region dataset copying/replication for critical tables if granular control is needed.
+    * **GCP Tool:** BigQuery (Multi-Region Datasets or Dataset Copies)
+* **Dataflow Pipeline Templates:**
+    * Pre-prepare and test **Dataflow job templates** that can be launched in either `europe-west1` or `europe-west4`. Ensure these templates are configurable to point to the appropriate regional resources (e.g., BigQuery datasets, Cloud Storage buckets).
+    * **GCP Tool:** Dataflow (Flex Templates/Classic Templates)
+* **Infrastructure as Code (IaC):**
+    * Manage all pipeline infrastructure (Pub/Sub topics/subscriptions, BigQuery datasets, Dataflow job definitions, storage buckets) using **IaC (e.g., Terraform)**. This enables rapid and consistent deployment of pipeline components in the secondary region.
+    * **GCP Tool:** Terraform (or Cloud Deployment Manager)
 
-# Wait for the replica instance to be READY
-echo "Waiting for replica SQL instance to be ready..."
-gcloud sql instances describe $REPLICA_SQL_INSTANCE --format="value(state)"
+**2. Outage Detection & Notification:**
 
-export BUCKET_NAME="dr-lab-multi-region-$(gcloud projects describe $GOOGLE_CLOUD_PROJECT --format='value(projectNumber)')"
+* **Failover Trigger:**
+    * **Automated Monitoring:** **Cloud Monitoring** detects critical failures within the `europe-west1` region, such as sustained Dataflow job failures, Pub/Sub message backlog increases, or unresponsiveness of services.
+    * **Alerting:** These monitoring alerts trigger notifications to designated **Pub/Sub alert topics**.
+    * **Notification:** Subscribers to the Pub/Sub alert topic (e.g., PagerDuty for critical alerts, Cloud Functions for automated responses) inform the operations team and potentially trigger automated failover scripts.
+    * **GCP Tool:** Cloud Monitoring, Pub/Sub
 
-gcloud storage buckets create gs://$BUCKET_NAME \
-    --location=US \
-    --uniform-bucket-level-access
+**3. Failover Process (Action during Outage):**
 
-# Create a sample file
-echo "Hello from Cloud Storage in us-central1 (primary)!" > gs_primary_content.txt
-gcloud storage cp gs_primary_content.txt gs://$BUCKET_NAME/app_data.txt
+* **Continuous Data Ingestion (Automatic):**
+    * Because Pub/Sub topics are global, inbound messages continue to be accepted even if `europe-west1` is down.
+    * **Cross-region Pub/Sub push subscriptions** (or pull consumers) running in `europe-west4` immediately begin processing messages from the global topics. This ensures **RPO < 5 minutes** for data ingestion, as messages are not lost and can be processed from the healthy region.
+    * Data ingested by these `europe-west4` consumers is immediately written to the **Multi-Region Cloud Storage bucket**, ensuring raw data archiving continues.
+* **Dataflow Pipeline Activation:**
+    * The operations team (or an automated script triggered by Pub/Sub alerts) launches a **new Dataflow job** from the pre-prepared template in the **`europe-west4` region**.
+    * This new Dataflow job reads from the relevant Pub/Sub subscription and processes data, writing output to the **Multi-Region BigQuery dataset** (if applicable) or the `europe-west4` specific BigQuery dataset.
+    * **GCP Tool:** Dataflow (Job Launching), Pub/Sub (Subscription processing), BigQuery (Dataset Access)
 
-echo "Verify file content in the bucket:"
-gcloud storage cat gs://$BUCKET_NAME/app_data.txt
+**4. Recovery & Failback (Post-Outage Cleanup):**
 
-#!/bin/bash
-# Install dependencies
-sudo apt-get update
-sudo apt-get install -y python3-pip git python3-psycopg2
+* **`europe-west1` Restoration Assessment:**
+    * Once Google Cloud confirms the stability and restoration of `europe-west1`, assess the region's health.
+* **Data Consistency Check:**
+    * Verify the consistency of data written to BigQuery and Cloud Storage during the failover period.
+* **Prepare `europe-west1` Pipeline:**
+    * Once `europe-west1` is stable, re-launch the primary Dataflow pipeline in `europe-west1`.
+    * Ensure any Pub/Sub subscriptions in `europe-west1` are reactivated or re-pointed if necessary.
+* **Phased Traffic Shift (if applicable):**
+    * If any external systems were configured to explicitly send data to `europe-west4` during the outage, slowly re-point them back to `europe-west1`. For Pub/Sub, no change is usually needed as topics are global.
+* **Resource Decommissioning:**
+    * Once the `europe-west1` pipeline is fully operational and verified, terminate the Dataflow job running in `europe-west4`. Scale down or remove any temporary `europe-west4` compute resources used for ingestion.
+* **Post-Mortem Analysis:** Conduct a thorough review of the incident, failover, and failback to identify lessons learned and improve the DR plan.
 
-# Install Flask and Google Cloud Storage client
-pip3 install Flask google-cloud-storage
+#### **Expected Result:**
 
-# Clone the app (simple Flask app)
-git clone https://github.com/GoogleCloudPlatform/python-docs-samples.git /tmp/python-docs-samples
-
-# Copy the app to the correct location
-cp /tmp/python-docs-samples/cloud-sql/postgresql/flask /app -r
-cd /app
-
-# Modify app.py to read from Cloud Storage and accept DB host from env
-# This is a simplified approach for the lab. In production, use proper config management.
-sed -i "s/db_user = os.environ.get('DB_USER')/db_user = os.environ.get('DB_USER', 'app_user')/g" app.py
-sed -i "s/db_password = os.environ.get('DB_PASS')/db_password = os.environ.get('DB_PASS', '${DB_PASSWORD}')/g" app.py
-sed -i "s/db_name = os.environ.get('DB_NAME')/db_name = os.environ.get('DB_NAME', 'app_db')/g" app.py
-sed -i "s/db_host = os.environ.get('DB_HOST')/db_host = os.environ.get('DB_HOST', '127.0.0.1')/g" app.py
-sed -i "/app.route('\/')/a \    storage_client = storage.Client()" app.py
-sed -i "/app.route('\/')/a \    bucket_name = os.environ.get('BUCKET_NAME', '')" app.py
-sed -i "/app.route('\/')/a \    bucket = storage_client.get_bucket(bucket_name)" app.py
-sed -i "/app.route('\/')/a \    blob = bucket.blob('app_data.txt')" app.py
-sed -i "/app.route('\/')/a \    gs_content = blob.download_as_text() if blob.exists() else 'N/A'" app.py
-sed -i "s/return 'Hello World!'/return f'Hello from {os.environ.get(\"REGION\")}. DB Host: {db_host}. GS Content: {gs_content}'/g" app.py
-
-
-# Set environment variables (for simplicity, passed via metadata for lab)
-# These will be passed via gcloud instance template metadata
-# export DB_HOST=$(gcloud sql instances describe dr-app-sql-primary-us-central1 --format="value(ipAddress)")
-# export BUCKET_NAME="dr-lab-multi-region-YOUR_PROJECT_NUMBER"
-# export REGION="us-central1"
-
-# Start the Flask app
-python3 app.py &
-
-# Get the IP address of the primary SQL instance
-PRIMARY_SQL_IP=$(gcloud sql instances describe $PRIMARY_SQL_INSTANCE --format="value(ipAddresses[0].ipAddress)")
-
-# Create instance template for us-central1
-gcloud compute instance-templates create dr-app-template-us-central1 \
-    --machine-type=e2-micro \
-    --network=dr-network \
-    --metadata-from-file=startup-script=startup.sh \
-    --metadata=DB_HOST="$PRIMARY_SQL_IP",BUCKET_NAME="$BUCKET_NAME",REGION="us-central1",DB_USER="$DB_USER",DB_PASS="$DB_PASSWORD",DB_NAME="$DB_NAME" \
-    --tags=http-server \
-    --image-family=debian-11 \
-    --image-project=debian-cloud
-
-# Create instance template for us-east1 (initially pointing to primary DB IP)
-gcloud compute instance-templates create dr-app-template-us-east1 \
-    --machine-type=e2-micro \
-    --network=dr-network \
-    --metadata-from-file=startup-script=startup.sh \
-    --metadata=DB_HOST="$PRIMARY_SQL_IP",BUCKET_NAME="$BUCKET_NAME",REGION="us-east1",DB_USER="$DB_USER",DB_PASS="$DB_PASSWORD",DB_NAME="$DB_NAME" \
-    --tags=http-server \
-    --image-family=debian-11 \
-    --image-project=debian-cloud
-
-# Create MIG in us-central1 (active)
-gcloud compute instance-groups managed create dr-app-mig-us-central1 \
-    --template=dr-app-template-us-central1 \
-    --size=1 \
-    --zone=us-central1-a # Choose an available zone in us-central1
-
-# Create MIG in us-east1 (scaled down, ready for failover)
-gcloud compute instance-groups managed create dr-app-mig-us-east1 \
-    --template=dr-app-template-us-east1 \
-    --size=0 \
-    --zone=us-east1-b # Choose an available zone in us-east1
-
-# 6a. Create health check
-gcloud compute health-checks create http http-dr-health-check \
-    --request-path=/ \
-    --port=80
-
-# 6b. Create backend service for us-central1 MIG (primary)
-gcloud compute backend-services create dr-backend-us-central1 \
-    --protocol=HTTP \
-    --health-checks=http-dr-health-check \
-    --global
-
-gcloud compute backend-services add-backend dr-backend-us-central1 \
-    --instance-group=dr-app-mig-us-central1 \
-    --instance-group-zone=us-central1-a \
-    --global
-
-# 6c. Create backend service for us-east1 MIG (secondary/failover)
-gcloud compute backend-services create dr-backend-us-east1 \
-    --protocol=HTTP \
-    --health-checks=http-dr-health-check \
-    --global
-
-gcloud compute backend-services add-backend dr-backend-us-east1 \
-    --instance-group=dr-app-mig-us-east1 \
-    --instance-group-zone=us-east1-b \
-    --global
-
-# Set primary/backup relationship using priority (lower number = higher priority)
-# us-central1 has higher priority (10), us-east1 has lower priority (20)
-gcloud compute backend-services update dr-backend-us-central1 --priority=10 --global
-gcloud compute backend-services update dr-backend-us-east1 --priority=20 --global
-
-# 6d. Create URL map, target HTTP proxy, and forwarding rule
-gcloud compute url-maps create dr-url-map --default-service=dr-backend-us-central1
-gcloud compute target-http-proxies create dr-http-proxy --url-map=dr-url-map
-gcloud compute forwarding-rules create dr-forwarding-rule \
-    --global \
-    --ports=80 \
-    --target-http-proxy=dr-http-proxy
-
-echo "Load Balancer setup complete. It may take several minutes for the IP to become active."
-
-gcloud compute forwarding-rules describe dr-forwarding-rule --global --format="value(IPAddress)"
-
-echo "Simulating us-central1 outage by scaling down its MIG..."
-gcloud compute instance-groups managed set-size dr-app-mig-us-central1 --size=0 --zone=us-central1-a
-
-echo "Promoting us-east1 replica to primary. This will break replication."
-gcloud sql instances promote-replica $REPLICA_SQL_INSTANCE
-
-# Get the IP address of the NEW primary SQL instance (the one just promoted)
-NEW_PRIMARY_SQL_IP=$(gcloud sql instances describe $REPLICA_SQL_INSTANCE --format="value(ipAddresses[0].ipAddress)")
-
-echo "New primary DB IP: $NEW_PRIMARY_SQL_IP"
-
-# Create a NEW instance template for us-east1 pointing to the new primary DB IP
-gcloud compute instance-templates create dr-app-template-us-east1-newdb \
-    --machine-type=e2-micro \
-    --network=dr-network \
-    --metadata-from-file=startup-script=startup.sh \
-    --metadata=DB_HOST="$NEW_PRIMARY_SQL_IP",BUCKET_NAME="$BUCKET_NAME",REGION="us-east1",DB_USER="$DB_USER",DB_PASS="$DB_PASSWORD",DB_NAME="$DB_NAME" \
-    --tags=http-server \
-    --image-family=debian-11 \
-    --image-project=debian-cloud
-
-# Update the us-east1 MIG to use the new template (rolling update)
-echo "Updating us-east1 MIG to use the new instance template..."
-gcloud compute instance-groups managed rolling-action start dr-app-mig-us-east1 \
-    --new-instance-template=dr-app-template-us-east1-newdb \
-    --zone=us-east1-b
-
-echo "Scaling up us-east1 MIG to handle traffic..."
-gcloud compute instance-groups managed set-size dr-app-mig-us-east1 --size=1 --zone=us-east1-b
-
-# Delete Load Balancer components
-gcloud compute forwarding-rules delete dr-forwarding-rule --global -q
-gcloud compute target-http-proxies delete dr-http-proxy --global -q
-gcloud compute url-maps delete dr-url-map -q
-gcloud compute backend-services delete dr-backend-us-central1 --global -q
-gcloud compute backend-services delete dr-backend-us-east1 --global -q
-gcloud compute health-checks delete http-dr-health-check -q
-
-# Delete Managed Instance Groups
-gcloud compute instance-groups managed delete dr-app-mig-us-central1 --zone=us-central1-a -q
-gcloud compute instance-groups managed delete dr-app-mig-us-east1 --zone=us-east1-b -q
-
-# Delete Instance Templates
-gcloud compute instance-templates delete dr-app-template-us-central1 -q
-gcloud compute instance-templates delete dr-app-template-us-east1 -q
-gcloud compute instance-templates delete dr-app-template-us-east1-newdb -q
-
-# Delete Cloud SQL Instances
-gcloud sql instances delete $PRIMARY_SQL_INSTANCE -q
-gcloud sql instances delete $REPLICA_SQL_INSTANCE -q
-
-# Delete Cloud Storage Bucket
-gcloud storage rm -r gs://$BUCKET_NAME -q
-
-# Delete Network and Firewall Rules
-gcloud compute firewall-rules delete dr-network-allow-all -q
-gcloud compute networks delete dr-network -q
-
-echo "All lab resources have been deleted. Verify in Google Cloud Console."
+Upon successful execution, we expect:
+* **Continuous Data Ingestion:** Near-zero interruption to incoming data streams, with messages processed and raw data archived.
+* **Minimal Data Loss (RPO < 5 mins):** Due to global Pub/Sub topics and multi-region storage, data is preserved even during a regional outage.
+* **Resumed Processing (RTO < 60 mins):** The core Dataflow processing pipeline will be re-activated in the secondary region within the target RTO.
+* **Business Continuity:** Analytics dashboards fed by the pipeline will eventually recover, and no critical raw data will be lost.
+* **Improved Resilience:** A validated and robust DR plan for our critical data pipeline.
